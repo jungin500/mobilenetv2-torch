@@ -1,0 +1,5 @@
+jupyter-experiments/
+.code/
+.vscode/
+**/__pycache__/
+outputs/
