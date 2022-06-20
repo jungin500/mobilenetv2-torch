@@ -410,9 +410,8 @@ def main() -> None:
         max_epochs=config.train_epochs,
         limit_train_batches=config.train_limit_batches,
         limit_val_batches=config.val_limit_batches,
-        enable_progress_bar=not config.headless,
         callbacks=[
-            # TQDMProgressBar(refresh_rate=1),
+            TQDMProgressBar(refresh_rate=1),
             ModelCheckpoint(
                 dirpath=checkpoint_dir,
                 filename='%s-epoch{epoch:04d}-val_acc{validation/accuracy:.2f}' % (
