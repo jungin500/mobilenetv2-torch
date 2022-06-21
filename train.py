@@ -6,7 +6,6 @@ from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, TQDMProgressBar, EarlyStopping
 from pytorch_lightning.plugins import DDPPlugin
 
-from loguru import logger
 import os
 
 # import albumentations as A
@@ -33,6 +32,7 @@ class LightningModel(pl.LightningModule):
                  base_path,
                  num_workers,
                  batch_size,
+                 learning_rate,
                  enable_dali=False,
                  is_headless=False
                  ):
@@ -50,7 +50,7 @@ class LightningModel(pl.LightningModule):
             elif isinstance(m, nn.Linear):
                 torch.nn.init.xavier_uniform_(m.weight)
 
-        self.lr = 0.02
+        self.lr = learning_rate
         self.weight_decay = 1e-5
         self.momentum = 0.1
         self.loss_module = torch.nn.CrossEntropyLoss()
@@ -282,6 +282,7 @@ def parse_args():
     parser.add_argument('--train-epochs', type=int, default=20)
     parser.add_argument('--train-limit-batches', type=float, default=1.0)
     parser.add_argument('--val-limit-batches', type=float, default=1.0)
+    parser.add_argument('--learning-rate', type=float, default=0.01)
     parser.add_argument('--headless', default=False, action='store_true')
 
     return parser.parse_args()
@@ -384,6 +385,7 @@ def main() -> None:
         config.dataset_path,
         config.num_workers,
         config.batch_size,
+        learning_rate=config.learning_rate,
         enable_dali=config.enable_dali,
         is_headless=config.headless
     )
