@@ -237,6 +237,11 @@ class LightningModel(pl.LightningModule):
         self.outputs.append(output)
 
     def on_validation_epoch_end(self):
+        # context-aware
+        if 'labels' not in dir(self):
+            self.labels = []
+            self.outputs = []
+        
         labels = np.concatenate(self.labels, axis=0)
         outputs = np.concatenate(self.outputs, axis=0)
 
