@@ -241,6 +241,8 @@ class LightningModel(pl.LightningModule):
         if 'labels' not in dir(self):
             self.labels = []
             self.outputs = []
+        if not self.labels or not self.outputs:
+            return
         
         labels = np.concatenate(self.labels, axis=0)
         outputs = np.concatenate(self.outputs, axis=0)
