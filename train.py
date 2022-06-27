@@ -3,7 +3,7 @@ from torch.utils.data import DataLoader
 
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, TQDMProgressBar, EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, RichProgressBar, EarlyStopping
 from pytorch_lightning.plugins import DDPPlugin
 
 import os
@@ -283,7 +283,7 @@ def parse_args():
     parser.add_argument('--batch-size', '-b', type=int, default=128)
     parser.add_argument('--num-workers', '-w', type=int, default=16)
     parser.add_argument('--num-gpus', '-g', type=int, default=1)
-    parser.add_argument('--train-strategy', default='none', choices=['ddp'])
+    parser.add_argument('--train-strategy', default='none', choices=['none', 'ddp'])
     parser.add_argument('--train-precision', type=int,
                         default=16, choices=[16, 32])
     parser.add_argument('--train-epochs', type=int, default=20)
@@ -420,7 +420,7 @@ def main() -> None:
         limit_train_batches=config.train_limit_batches,
         limit_val_batches=config.val_limit_batches,
         callbacks=[
-            TQDMProgressBar(refresh_rate=1),
+            RichProgressBar(refresh_rate=1),
             ModelCheckpoint(
                 dirpath=checkpoint_dir,
                 filename='%s-epoch{epoch:04d}-val_acc{validation/accuracy:.2f}' % (

@@ -12,3 +12,4 @@ numpy
 loguru
 torchinfo
 scikit-learn
+rich
