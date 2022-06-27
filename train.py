@@ -4,7 +4,7 @@ from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, RichProgressBar, EarlyStopping
-from pytorch_lightning.plugins import DDPPlugin
+from pytorch_lightning.strategies import DDPStrategy
 
 import os
 
@@ -175,7 +175,7 @@ class LightningModel(pl.LightningModule):
         optimizer = optim.Adam(self.model.parameters(
         ), lr=self.lr, weight_decay=self.weight_decay)  # , momentum=self.momentum)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='max', factor=0.5, patience=2, verbose=True, threshold=3e-3, threshold_mode='abs')
+            optimizer, mode='max', factor=0.5, patience=2, verbose=False, threshold=3e-3, threshold_mode='abs')
         return {
             "optimizer": optimizer,
             "lr_scheduler": scheduler,
@@ -218,6 +218,12 @@ class LightningModel(pl.LightningModule):
                  on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("train/loss", loss, on_step=True, sync_dist=True)
         return loss
+    
+    def on_train_batch_end(self, outputs, batch, batch_idx: int, unused: int = 0) -> None:
+        if self.local_rank and self.headless:
+            if batch_idx % 100 == 0:
+                print("\n", end='', flush=True)  # for Kubernetes to display progresbar correctly
+        return super().on_train_batch_end(outputs, batch, batch_idx, unused)
 
     def on_validation_epoch_start(self):
         self.labels = []
@@ -407,7 +413,7 @@ def main() -> None:
     if config.train_strategy and config.train_strategy.lower() != 'none':
         strategy = config.train_strategy
         if strategy.lower() == 'ddp':
-            strategy = DDPPlugin(find_unused_parameters=False)
+            strategy = DDPStrategy(find_unused_parameters=False)
 
     trainer = pl.Trainer(
         logger=lightning_logger,
