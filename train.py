@@ -401,7 +401,7 @@ def main() -> None:
         is_headless=config.headless
     )
 
-    if wandb_enabled:
+    if wandb_enabled and config.num_gpus <= 1:
         lightning_logger.watch(model)
 
     if config.num_gpus == 0:
