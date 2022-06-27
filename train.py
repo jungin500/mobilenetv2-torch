@@ -22,9 +22,9 @@ from torch import nn
 
 import numpy as np
 from torchinfo import summary
-from sklearn.metrics import precision_score, recall_score, f1_score
 
 import pytorch_lightning as pl
+from torchmetrics.classification import Accuracy, F1Score, Precision, Recall
 
 
 class LightningModel(pl.LightningModule):
@@ -68,6 +68,11 @@ class LightningModel(pl.LightningModule):
         self.dataset_path = base_path
         self.num_workers = num_workers
         self.batch_size = batch_size
+        
+        self.m_acc = Accuracy()
+        self.m_f1 = F1Score()
+        self.m_precision = Precision()
+        self.m_recall = Recall()
 
     def prepare_data(self, *args, **kwargs):
         if self.use_dali:
@@ -183,20 +188,20 @@ class LightningModel(pl.LightningModule):
         }
 
     def on_fit_start(self):
-        if self.headless:
+        if self.local_rank == 0 and self.headless:
             logger.info("Begin training in headless mode")
 
-    def on_epoch_start(self) -> None:
+    def on_train_epoch_start(self) -> None:
         if not self.trainer.sanity_checking and self.headless:
             logger.info(
                 f"[State={self.trainer.state.status}] Epoch {self.trainer.current_epoch} begin")
-        return super().on_epoch_start()
+        return super().on_train_epoch_start()
 
-    def on_epoch_end(self) -> None:
+    def on_train_epoch_end(self) -> None:
         if not self.trainer.sanity_checking and self.headless:
             logger.info(
                 f"[State={self.trainer.state.status}] Epoch {self.trainer.current_epoch} end")
-        return super().on_epoch_end()
+        return super().on_train_epoch_end()
 
     def training_epoch_end(self, outputs):
         self.forward_idx += 1
@@ -214,57 +219,50 @@ class LightningModel(pl.LightningModule):
             labels = labels.cpu().numpy()
             output = output.cpu().numpy()
 
-        self.log("train/accuracy", accuracy, on_step=True,
-                 on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("train/accuracy", accuracy, on_step=True, prog_bar=True, sync_dist=True)
         self.log("train/loss", loss, on_step=True, sync_dist=True)
         return loss
     
     def on_train_batch_end(self, outputs, batch, batch_idx: int, unused: int = 0) -> None:
-        if self.local_rank and self.headless:
+        if self.local_rank == 0 and self.headless:
             if batch_idx % 100 == 0:
                 print("\n", end='', flush=True)  # for Kubernetes to display progresbar correctly
         return super().on_train_batch_end(outputs, batch, batch_idx, unused)
-
-    def on_validation_epoch_start(self):
-        self.labels = []
-        self.outputs = []
 
     def validation_step(self, batch, batch_idx):
         images, labels = batch
 
         output = self.model(images)
-
         output = torch.argmax(torch.log_softmax(output, -1), -1)
-
-        labels = labels.float().cpu().numpy()
-        output = output.float().cpu().numpy()
-
-        self.labels.append(labels)
-        self.outputs.append(output)
+        
+        acc = self.m_acc(output, labels)
+        precision = self.m_precision(output, labels)
+        recall = self.m_recall(output, labels)
+        f1 = self.m_f1(output, labels)
+        
+        return {
+            'validation/accuracy': acc,
+            'validation/precision': precision,
+            'validation/recall': recall,
+            'validation/f1': f1
+        }
 
     def on_validation_epoch_end(self):
-        # context-aware
-        if 'labels' not in dir(self):
-            self.labels = []
-            self.outputs = []
-        if not self.labels or not self.outputs:
-            return
-        
-        labels = np.concatenate(self.labels, axis=0)
-        outputs = np.concatenate(self.outputs, axis=0)
-
-        accuracy = np.mean(np.equal(labels, outputs).astype(np.float32))
-        precision = precision_score(
-            labels, outputs, average='weighted', zero_division=0)
-        recall = recall_score(
-            labels, outputs, average='weighted', zero_division=0)
-        f1 = f1_score(labels, outputs, average='weighted', zero_division=0)
+        accuracy = self.m_acc.compute()
+        precision = self.m_precision.compute()
+        recall = self.m_recall.compute()
+        f1 = self.m_f1.compute()
 
         self.log("validation/accuracy", accuracy,
                  prog_bar=True, sync_dist=True)
         self.log("validation/precision", precision)
         self.log("validation/recall", recall)
         self.log("validation/f1", f1)
+        
+        self.m_acc.reset()
+        self.m_precision.reset()
+        self.m_recall.reset()
+        self.m_f1.reset()
 
         # Do not update scheduler while initializing
         if not self.trainer.sanity_checking:
