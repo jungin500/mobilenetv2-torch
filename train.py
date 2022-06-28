@@ -42,8 +42,7 @@ class LightningModel(pl.LightningModule):
 
         summary(self.model, (1, 3, 224, 224), device='cpu')
 
-        logger.info(
-            "Initializing weight (Kaiming for Conv2d, Xavier for Linear")
+        # logger.info("Initializing weight (Kaiming for Conv2d, Xavier for Linear)")
         for m in self.model.modules():
             if isinstance(m, nn.Conv2d):
                 torch.nn.init.kaiming_uniform_(m.weight)
@@ -61,7 +60,7 @@ class LightningModel(pl.LightningModule):
         #     state_dict = torch.load(config.model.pretrained.path)
         #     self.load_state_dict(state_dict['state_dict'])
         # else:
-        logger.warning("Training from scratch without pretrained model")
+        # logger.warning("Training from scratch without pretrained model")
 
         self.use_dali = enable_dali
         self.headless = is_headless
@@ -235,17 +234,10 @@ class LightningModel(pl.LightningModule):
         output = self.model(images)
         output = torch.argmax(torch.log_softmax(output, -1), -1)
         
-        acc = self.m_acc(output, labels)
-        precision = self.m_precision(output, labels)
-        recall = self.m_recall(output, labels)
-        f1 = self.m_f1(output, labels)
-        
-        return {
-            'validation/accuracy': acc,
-            'validation/precision': precision,
-            'validation/recall': recall,
-            'validation/f1': f1
-        }
+        self.m_acc.update(output, labels)
+        self.m_precision.update(output, labels)
+        self.m_recall.update(output, labels)
+        self.m_f1.update(output, labels)
 
     def on_validation_epoch_end(self):
         accuracy = self.m_acc.compute()
@@ -253,11 +245,10 @@ class LightningModel(pl.LightningModule):
         recall = self.m_recall.compute()
         f1 = self.m_f1.compute()
 
-        self.log("validation/accuracy", accuracy,
-                 prog_bar=True, sync_dist=True)
-        self.log("validation/precision", precision)
-        self.log("validation/recall", recall)
-        self.log("validation/f1", f1)
+        self.log("validation/accuracy", accuracy, prog_bar=True, sync_dist=True)
+        self.log("validation/precision", precision, sync_dist=True)
+        self.log("validation/recall", recall, sync_dist=True)
+        self.log("validation/f1", f1, sync_dist=True)
         
         self.m_acc.reset()
         self.m_precision.reset()
@@ -276,7 +267,7 @@ class LightningModel(pl.LightningModule):
 def parse_args():
     parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
     parser.add_argument('--train-base-dir', '-d',
-                        default='/home/jungin500/Workspace/mobilenetv2/outputs')
+                        default='./outputs')
     parser.add_argument('--disable-wandb', default=False, action='store_true')
     parser.add_argument('--wandb-login-key', default=None)
     parser.add_argument('--wandb-project', default='mobilenetv3')
@@ -295,21 +286,22 @@ def parse_args():
     parser.add_argument('--val-limit-batches', type=float, default=1.0)
     parser.add_argument('--learning-rate', type=float, default=0.01)
     parser.add_argument('--headless', default=False, action='store_true')
+    parser.add_argument('--resume', default=None, type=str, help='Resume after given checkpoint')
 
     return parser.parse_args()
 
 
 def main() -> None:
-    config = parse_args()
+    args = parse_args()
 
-    base_dir = config.train_base_dir
+    base_dir = args.train_base_dir
     checkpoint_dir = os.path.join(base_dir, 'checkpoints')
 
     # directory internally used by pytorch lightning
     trainer_root_dir = os.path.join(base_dir, 'trainer')
     os.makedirs(trainer_root_dir, exist_ok=True)
 
-    wandb_enabled = not config.disable_wandb
+    wandb_enabled = not args.disable_wandb
 
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -320,19 +312,19 @@ def main() -> None:
         wandb_log_dir = os.path.join(base_dir, 'wandb')
         os.makedirs(wandb_log_dir, exist_ok=True)
 
-        if config.wandb_login_key != 'None' and config.wandb_login_key is not None:
+        if args.wandb_login_key != 'None' and args.wandb_login_key is not None:
             import wandb
-            wandb.login(key=config.wandb_login_key)
+            wandb.login(key=args.wandb_login_key)
 
         lightning_logger = WandbLogger(
-            name=config.expr_name,
-            project=config.wandb_project,
+            name=args.expr_name,
+            project=args.wandb_project,
             save_dir=base_dir
         )
     else:
         lightning_logger = True
 
-    if config.enable_dali:
+    if args.enable_dali:
         pass  # Initializing inside model
     else:
         train_transform = T.Compose([
@@ -358,7 +350,7 @@ def main() -> None:
 
         logger.info("Loading trainset")
         train_dataset = ImageNet(
-            root=config.dataset_path,
+            root=args.dataset_path,
             split='train',
             transform=train_transform,
             # target_transform=target_transform
@@ -367,7 +359,7 @@ def main() -> None:
 
         logger.info("Loading validset")
         val_dataset = ImageNet(
-            root=config.dataset_path,
+            root=args.dataset_path,
             split='val',
             transform=val_transform,
             # target_transform=target_transform
@@ -376,9 +368,9 @@ def main() -> None:
 
         train_loader = DataLoader(
             train_dataset,
-            batch_size=config.batch_size,
+            batch_size=args.batch_size,
             shuffle=True,
-            num_workers=config.num_workers,
+            num_workers=args.num_workers,
             pin_memory=True,
             persistent_workers=True
         )
@@ -393,50 +385,51 @@ def main() -> None:
         )
 
     model = LightningModel(
-        config.dataset_path,
-        config.num_workers,
-        config.batch_size,
-        learning_rate=config.learning_rate,
-        enable_dali=config.enable_dali,
-        is_headless=config.headless
+        args.dataset_path,
+        args.num_workers,
+        args.batch_size,
+        learning_rate=args.learning_rate,
+        enable_dali=args.enable_dali,
+        is_headless=args.headless
     )
 
-    if wandb_enabled and config.num_gpus <= 1:
+    if wandb_enabled and args.num_gpus <= 1:
         lightning_logger.watch(model)
 
-    if config.num_gpus == 0:
+    if args.num_gpus == 0:
         logger.warning("Training with CPU, falling back to BF16 format")
 
     strategy = None
-    if config.train_strategy and config.train_strategy.lower() != 'none':
-        strategy = config.train_strategy
+    if args.train_strategy and args.train_strategy.lower() != 'none':
+        strategy = args.train_strategy
         if strategy.lower() == 'ddp':
             strategy = DDPStrategy(find_unused_parameters=False)
 
     trainer = pl.Trainer(
         logger=lightning_logger,
         default_root_dir=trainer_root_dir,
-        accelerator='gpu' if config.num_gpus > 0 else 'cpu',
-        gpus=config.num_gpus,
+        accelerator='gpu' if args.num_gpus > 0 else 'cpu',
+        gpus=args.num_gpus,
         strategy=strategy,
-        precision=config.train_precision if config.num_gpus > 0 else 'bf16',
-        max_epochs=config.train_epochs,
-        limit_train_batches=config.train_limit_batches,
-        limit_val_batches=config.val_limit_batches,
+        precision=args.train_precision if args.num_gpus > 0 else 'bf16',
+        max_epochs=args.train_epochs,
+        limit_train_batches=args.train_limit_batches,
+        limit_val_batches=args.val_limit_batches,
         callbacks=[
             RichProgressBar(refresh_rate=1),
             ModelCheckpoint(
                 dirpath=checkpoint_dir,
-                filename='%s-epoch{epoch:04d}-val_acc{validation/accuracy:.2f}' % (
-                    config.expr_name),
-                mode="max", monitor="validation/f1"
+                filename='%s-epoch{epoch:04d}-val_acc{validation/accuracy:.2f}' % (args.expr_name),
+                auto_insert_metric_name=False,
+                mode="max", monitor="validation/accuracy", verbose=True
             ),
             LearningRateMonitor("epoch"),
             EarlyStopping(
                 monitor="validation/accuracy",
-                patience=5,
+                patience=10,
                 min_delta=0.005,
                 mode="max",
+                verbose=True
             )
         ]
     )
@@ -445,10 +438,18 @@ def main() -> None:
         trainer.logger._log_graph = True
         trainer.logger._default_hp_metric = None
 
-    if config.enable_dali:
-        trainer.fit(model)  # Dataloader is initialized inside model
+    if args.enable_dali:
+        if args.resume:
+            logger.info("Resuming from checkpoint %s ..." % (args.resume))
+            trainer.fit(model, ckpt_path=args.resume)
+        else:
+            trainer.fit(model)  # Dataloader is initialized inside model
     else:
-        trainer.fit(model, train_loader, val_loader)
+        if args.resume:
+            logger.info("Resuming from checkpoint %s ..." % (args.resume))
+            trainer.fit(model, train_loader, val_loader, ckpt_path=args.resume)
+        else:
+            trainer.fit(model, train_loader, val_loader)
 
 
 if __name__ == '__main__':
