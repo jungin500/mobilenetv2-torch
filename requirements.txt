@@ -13,3 +13,4 @@ loguru
 torchinfo
 rich
 torchmetrics
+webdataset

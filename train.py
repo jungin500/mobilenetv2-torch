@@ -266,27 +266,28 @@ class LightningModel(pl.LightningModule):
 
 def parse_args():
     parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--train-base-dir', '-d',
-                        default='./outputs')
+    parser.add_argument('--train-base-dir', default='./outputs')
     parser.add_argument('--disable-wandb', default=False, action='store_true')
     parser.add_argument('--wandb-login-key', default=None)
     parser.add_argument('--wandb-project', default='mobilenetv3')
     parser.add_argument('--expr-name', default='mbv3-b128-1gpu-scratch')
-    parser.add_argument('--enable-dali', '-n',
-                        default=False, action='store_true')
-    parser.add_argument('--dataset-path', '-p', default='/datasets/imagenet')
+    parser.add_argument('--enable-dali', '-n', default=False, action='store_true')
+    parser.add_argument('--dataset-path', default='/datasets/imagenet')
+    parser.add_argument('--wds-train-url', default='/datasets/imagenet/train', help='Dataset path only for webdataset')
+    parser.add_argument('--wds-val-url', default='/datasets/imagenet/val', help='Dataset path only for webdataset')
+    parser.add_argument('--webdataset', default=False, action='store_true', help='Enable webdataset with given --{train|val}-dataset-path')
     parser.add_argument('--batch-size', '-b', type=int, default=128)
     parser.add_argument('--num-workers', '-w', type=int, default=16)
     parser.add_argument('--num-gpus', '-g', type=int, default=1)
     parser.add_argument('--train-strategy', default='none', choices=['none', 'ddp'])
-    parser.add_argument('--train-precision', type=int,
-                        default=16, choices=[16, 32])
+    parser.add_argument('--train-precision', type=int, default=16, choices=[16, 32])
     parser.add_argument('--train-epochs', type=int, default=20)
     parser.add_argument('--train-limit-batches', type=float, default=1.0)
     parser.add_argument('--val-limit-batches', type=float, default=1.0)
     parser.add_argument('--learning-rate', type=float, default=0.01)
     parser.add_argument('--headless', default=False, action='store_true')
     parser.add_argument('--resume', default=None, type=str, help='Resume after given checkpoint')
+    parser.add_argument('--debug','-d', default=False, action='store_true', help="Debug mode (disables all automation including wandb")
 
     return parser.parse_args()
 
@@ -301,7 +302,7 @@ def main() -> None:
     trainer_root_dir = os.path.join(base_dir, 'trainer')
     os.makedirs(trainer_root_dir, exist_ok=True)
 
-    wandb_enabled = not args.disable_wandb
+    wandb_enabled = not args.disable_wandb and not args.debug
 
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -325,8 +326,77 @@ def main() -> None:
         lightning_logger = True
 
     if args.enable_dali:
+        logger.info("Creating DALI pipeline inside LightningModule")
         pass  # Initializing inside model
+    elif args.webdataset:
+        import webdataset as wds
+        from pathlib import Path
+        from PIL import Image
+        import io
+        import cv2
+        
+        logger.info("Creating Webdataset dataloader")
+        
+        def cv2decode(value):
+            image = cv2.imdecode(np.frombuffer(value, dtype=np.uint8), cv2.IMREAD_COLOR)
+            image = cv2.resize(image, (224, 224))
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            image = Image.fromarray(image)
+            return image
+        
+        train_ds_url, val_ds_url = args.wds_train_url, args.wds_val_url
+        train_dataset = wds.WebDataset(train_ds_url).shuffle(1000).decode(wds.handle_extension('jpg jpeg', cv2decode)).to_tuple("jpeg", "__key__")
+        val_dataset = wds.WebDataset(val_ds_url).shuffle(1000).decode(wds.handle_extension('jpg jpeg', cv2decode)).to_tuple("jpeg", "__key__")
+    
+        synset_to_class_map = { k[0]: int(k[1]) for k in [line.split(' ') for line in open('imagenet_synset_to_class.txt', 'r').read().strip().splitlines()] }
+        
+        train_transform = T.Compose([
+            # T.RandomHorizontalFlip(p=0.5),
+            # T.RandomVerticalFlip(p=0.5),
+            # T.RandomAutocontrast(p=0.5),
+            T.ToTensor(),
+            T.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+        
+        val_transform = T.Compose([
+            T.ToTensor(),
+            T.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+        
+        def create_preprocessor(transform=lambda image: image):
+            def preprocess(sample):
+                image, key = sample
+                synset_name = str(Path(key).parent)
+                class_id = synset_to_class_map[synset_name]
+                
+                image = transform(image)
+                return image, class_id
+            
+            return preprocess
+        
+        train_dataset = train_dataset.map(create_preprocessor(train_transform))
+        val_dataset = val_dataset.map(create_preprocessor(val_transform))
+        
+        train_loader = wds.WebLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
+        
+        val_loader = wds.WebLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
+        
     else:
+        logger.info("Creating standard ImageNet dataloader")
         train_transform = T.Compose([
             T.Resize([224, 224]),
             # T.RandomHorizontalFlip(p=0.5),
