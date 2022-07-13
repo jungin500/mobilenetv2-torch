@@ -224,8 +224,8 @@ class LightningModel(pl.LightningModule):
     
     def on_train_batch_end(self, outputs, batch, batch_idx: int, unused: int = 0) -> None:
         if self.local_rank == 0 and self.headless:
-            if batch_idx % 100 == 0:
-                print("\n", end='', flush=True)  # for Kubernetes to display progresbar correctly
+            if batch_idx % 10 == 0:
+                print("\r\n", end='', flush=True)  # for Kubernetes to display progresbar correctly
         return super().on_train_batch_end(outputs, batch, batch_idx, unused)
 
     def validation_step(self, batch, batch_idx):
@@ -475,6 +475,10 @@ def main() -> None:
         if strategy.lower() == 'ddp':
             strategy = DDPStrategy(find_unused_parameters=False)
 
+    if args.webdataset:
+        args.train_limit_batches = int(1282000 / args.batch_size)
+        args.val_limit_batches = int(50000 / args.batch_size)
+        
     trainer = pl.Trainer(
         logger=lightning_logger,
         default_root_dir=trainer_root_dir,
