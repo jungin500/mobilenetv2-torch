@@ -178,8 +178,9 @@ class LightningModel(pl.LightningModule):
     def configure_optimizers(self):
         optimizer = optim.Adam(self.model.parameters(
         ), lr=self.lr, weight_decay=self.weight_decay)  # , momentum=self.momentum)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='max', factor=0.5, patience=2, verbose=False, threshold=3e-3, threshold_mode='abs')
+        # scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        #     optimizer, mode='max', factor=0.5, patience=2, verbose=False, threshold=3e-3, threshold_mode='abs')
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
         return {
             "optimizer": optimizer,
             "lr_scheduler": scheduler,
@@ -291,6 +292,7 @@ def parse_args():
     parser.add_argument('--val-limit-batches', type=float, default=1.0)
     parser.add_argument('--learning-rate', type=float, default=0.01)
     parser.add_argument('--headless', default=False, action='store_true')
+    parser.add_argument('--early-stop', default=False, action='store_true', help='Enables early stopping')
     parser.add_argument('--resume', default=None, type=str, help='Resume after given checkpoint')
     parser.add_argument('--debug','-d', default=False, action='store_true', help="Debug mode (disables all automation including wandb")
 
@@ -484,6 +486,28 @@ def main() -> None:
         args.train_limit_batches = int(1282000 / args.batch_size)
         args.val_limit_batches = int(50000 / args.batch_size)
         
+    callbacks = [
+        RichProgressBar(refresh_rate=1),
+        ModelCheckpoint(
+            dirpath=checkpoint_dir,
+            filename='%s-epoch{epoch:04d}-val_acc{validation/accuracy:.2f}' % (args.expr_name),
+            auto_insert_metric_name=False,
+            mode="max", monitor="validation/accuracy", verbose=True
+        ),
+        LearningRateMonitor("epoch")
+    ]
+    
+    if args.early_stop:
+        callbacks.append(
+            EarlyStopping(
+                monitor="validation/accuracy",
+                patience=10,
+                min_delta=0.005,
+                mode="max",
+                verbose=True
+            )
+        )
+        
     trainer = pl.Trainer(
         logger=lightning_logger,
         default_root_dir=trainer_root_dir,
@@ -494,23 +518,7 @@ def main() -> None:
         max_epochs=args.train_epochs,
         limit_train_batches=args.train_limit_batches,
         limit_val_batches=args.val_limit_batches,
-        callbacks=[
-            RichProgressBar(refresh_rate=1),
-            ModelCheckpoint(
-                dirpath=checkpoint_dir,
-                filename='%s-epoch{epoch:04d}-val_acc{validation/accuracy:.2f}' % (args.expr_name),
-                auto_insert_metric_name=False,
-                mode="max", monitor="validation/accuracy", verbose=True
-            ),
-            LearningRateMonitor("epoch"),
-            EarlyStopping(
-                monitor="validation/accuracy",
-                patience=10,
-                min_delta=0.005,
-                mode="max",
-                verbose=True
-            )
-        ]
+        callbacks=callbacks
     )
 
     if wandb_enabled:
