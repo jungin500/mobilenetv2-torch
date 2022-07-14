@@ -238,23 +238,28 @@ class LightningModel(pl.LightningModule):
         self.m_precision.update(output, labels)
         self.m_recall.update(output, labels)
         self.m_f1.update(output, labels)
-
-    def on_validation_epoch_end(self):
-        accuracy = self.m_acc.compute()
-        precision = self.m_precision.compute()
-        recall = self.m_recall.compute()
-        f1 = self.m_f1.compute()
-
-        self.log("validation/accuracy", accuracy, prog_bar=True, sync_dist=True)
-        self.log("validation/precision", precision, sync_dist=True)
-        self.log("validation/recall", recall, sync_dist=True)
-        self.log("validation/f1", f1, sync_dist=True)
         
+    def on_validation_epoch_start(self):        
         self.m_acc.reset()
         self.m_precision.reset()
         self.m_recall.reset()
         self.m_f1.reset()
 
+    def on_validation_epoch_end(self):
+        if '_update_count' in dir(self.m_acc) and self.m_acc._update_count == 0:
+            logger.info("Skipped logging validation metrics")
+            return
+        
+        accuracy = self.m_acc.compute()
+        precision = self.m_precision.compute()
+        recall = self.m_recall.compute()
+        f1 = self.m_f1.compute()
+
+        self.log("validation/accuracy", accuracy, prog_bar=True)
+        self.log("validation/precision", precision)
+        self.log("validation/recall", recall)
+        self.log("validation/f1", f1)
+        
         # Do not update scheduler while initializing
         if not self.trainer.sanity_checking:
             # Manually update lr_scheduler
