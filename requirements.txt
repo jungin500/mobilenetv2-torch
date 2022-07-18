@@ -11,4 +11,6 @@ opencv-python-headless
 numpy
 loguru
 torchinfo
-scikit-learn
+rich
+torchmetrics
+webdataset
