@@ -22,6 +22,10 @@ jobs:
     # Checkout repository to current directory
     - name: Checkout repository
       uses: actions/checkout@v3
+      
+    - name: Check current folder and checkout directory
+      run: |
+        ls -al && ls -al 
     
     # Login against a Docker registry except on PR
     # https://github.com/docker/login-action
@@ -47,10 +51,12 @@ jobs:
         docker build --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} -f - . <<EOF
         FROM nvcr.io/nvidia/pytorch:22.06-py3
         
+        ADD requirements.txt /tmp/
+        
         RUN set -ex &&\
             \
-            python3 -m pip install -r requirements.txt &&\
-            rm -rf /workspace/*
+            python3 -m pip install -r /tmp/requirements.txt &&\
+            rm -rf /workspace/* && rm -f /tmp/requirements.txt
         EOF
         
     - name: Push Docker Image
