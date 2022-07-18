@@ -1,0 +1,26 @@
+name: Docker Image CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+    - name: Build the Docker image
+      run: |
+        docker build .  --tag jungin500/mobilenet_v2:$(date +%s) - <<EOF
+        FROM nvcr.io/nvidia/pytorch:22.06-py3
+        
+        RUN set -ex &&\
+            \
+            python3 -m pip install -r requirements.txt &&\
+            rm -rf /workspace/*
+        EOF
