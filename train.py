@@ -57,7 +57,7 @@ class LightningModel(pl.LightningModule):
                 torch.nn.init.xavier_uniform_(m.weight)
 
         self.lr = learning_rate
-        self.weight_decay = 1e-4
+        self.weight_decay = 4e-5
         self.momentum = 1e-4
         self.forward_idx = 0
         self.num_epochs = num_epochs
@@ -224,7 +224,12 @@ class LightningModel(pl.LightningModule):
         optimizer = optim.SGD(self.model.parameters(), lr=self.lr, momentum=self.momentum, weight_decay=self.weight_decay)
         return optimizer
 
-    def adjust_learning_rate(self, optimizer, epoch, total_epochs, iteration, num_iter, warmup=False, gamma=0.1, lr_decay='step', init_lr=0.1, schedule=[150, 225]):
+    def adjust_learning_rate(self, iteration, warmup=False, gamma=0.1, lr_decay='cos', init_lr=0.05, schedule=[150, 225]):
+        optimizer = self.optimizers()
+        epoch = self.current_epoch
+        total_epochs = self.num_epochs
+        num_iter = len(self.train_loader)  # Will not work on non-DALI environment!
+        
         lr = optimizer.param_groups[0]['lr']
 
         warmup_epoch = 5 if warmup else 0
@@ -255,6 +260,8 @@ class LightningModel(pl.LightningModule):
         if self.local_rank == 0 and self.headless:
             logger.info("Begin training in headless mode")
 
+        self.adjust_learning_rate(0)
+        
     def on_train_epoch_start(self) -> None:
         if not self.trainer.sanity_checking and self.headless:
             logger.info(
@@ -272,8 +279,7 @@ class LightningModel(pl.LightningModule):
         return super().training_epoch_end(outputs)
 
     def training_step(self, batch, batch_idx):
-        optimizer = self.optimizers()
-        self.adjust_learning_rate(optimizer, self.current_epoch, self.num_epochs, batch_idx, len(self.train_loader))
+        self.adjust_learning_rate(batch_idx)
         
         images, labels = batch
         output = self.model(images)
@@ -352,7 +358,7 @@ def parse_args():
     parser.add_argument('--train-epochs', type=int, default=20)
     parser.add_argument('--train-limit-batches', type=float, default=1.0)
     parser.add_argument('--val-limit-batches', type=float, default=1.0)
-    parser.add_argument('--learning-rate', type=float, default=0.01)
+    parser.add_argument('--learning-rate', type=float, default=0.05)
     parser.add_argument('--headless', default=False, action='store_true')
     parser.add_argument('--early-stop', default=False, action='store_true', help='Enables early stopping')
     parser.add_argument('--resume', default=None, type=str, help='Resume after given checkpoint')
@@ -573,7 +579,7 @@ def main() -> None:
             auto_insert_metric_name=False,
             mode="max", monitor="validation/accuracy/top1"
         ),
-        LearningRateMonitor("epoch")
+        LearningRateMonitor(logging_interval='step')
     ]
     
     if args.early_stop:
@@ -589,6 +595,7 @@ def main() -> None:
         
     trainer = pl.Trainer(
         logger=lightning_logger,
+        log_every_n_steps=5,
         default_root_dir=trainer_root_dir,
         accelerator='gpu' if args.num_gpus > 0 else 'cpu',
         gpus=args.num_gpus,
