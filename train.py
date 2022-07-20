@@ -19,12 +19,15 @@ from loguru import logger
 import torch
 from torch import optim
 from torch import nn
+import torch.nn.functional as F
 
 import numpy as np
 from torchinfo import summary
 
 import pytorch_lightning as pl
 from torchmetrics.classification import Accuracy, F1Score, Precision, Recall
+from math import cos, pi
+from datetime import datetime
 
 
 class LightningModel(pl.LightningModule):
@@ -32,9 +35,13 @@ class LightningModel(pl.LightningModule):
                  base_path,
                  num_workers,
                  batch_size,
+                 num_epochs,
                  learning_rate,
                  enable_dali=False,
-                 is_headless=False
+                 dali_wds=False,
+                 is_headless=False,
+                 wds_dali_train_taritems=None,
+                 wds_dali_val_taritems=None,
                  ):
         super().__init__()
 
@@ -50,10 +57,10 @@ class LightningModel(pl.LightningModule):
                 torch.nn.init.xavier_uniform_(m.weight)
 
         self.lr = learning_rate
-        self.weight_decay = 1e-5
-        self.momentum = 0.1
-        self.loss_module = torch.nn.CrossEntropyLoss()
+        self.weight_decay = 1e-4
+        self.momentum = 1e-4
         self.forward_idx = 0
+        self.num_epochs = num_epochs
 
         # if bool(config.model.pretrained.enabled):
         #     logger.info("Loading pretrained model")
@@ -63,12 +70,16 @@ class LightningModel(pl.LightningModule):
         # logger.warning("Training from scratch without pretrained model")
 
         self.use_dali = enable_dali
+        self.use_dali_wds = dali_wds
+        self.wds_dali_train_taritems = wds_dali_train_taritems
+        self.wds_dali_val_taritems = wds_dali_val_taritems
         self.headless = is_headless
         self.dataset_path = base_path
         self.num_workers = num_workers
         self.batch_size = batch_size
         
         self.m_acc = Accuracy()
+        self.m_acc_t5 = Accuracy(top_k=5)
         self.m_f1 = F1Score()
         self.m_precision = Precision()
         self.m_recall = Recall()
@@ -91,27 +102,52 @@ class LightningModel(pl.LightningModule):
         from nvidia.dali.plugin.pytorch import DALIClassificationIterator, LastBatchPolicy
         import torch
         import os
+        
+        enable_wds = self.use_dali_wds
+        wds_dali_train_taritems = self.wds_dali_train_taritems
+        wds_dali_val_taritems = self.wds_dali_val_taritems
 
         @pipeline_def
-        def GetImageNetPipeline(device, data_path, shuffle, shard_id=0, num_shards=1):
-            jpegs, labels = fn.readers.file(
-                file_root=data_path,
-                # random_shuffle=False,  # (shuffles inside a initial_fill)
-                shuffle_after_epoch=shuffle,  # (shuffles entire datasets)
-                name="Reader",
-                shard_id=shard_id, num_shards=num_shards
-            )
+        def GetImageNetPipeline(device, data_path, shuffle, shard_id=0, num_shards=1, is_test=False):
+            if enable_wds:
+                logger.warning("Enabling experimental WDS support for DALI pipeline")
+                from pathlib import Path
+                
+                synset_to_class_map = { k[0]: int(k[1]) for k in [line.split(' ') for line in open('imagenet_synset_to_class.txt', 'r').read().strip().splitlines()] }
+                def label_preprocess(key):
+                    synset_name = str(Path(key).parent)
+                    class_id = synset_to_class_map[synset_name]
+                    return class_id
+                
+                jpegs, key = fn.readers.webdataset(
+                    paths=data_path,
+                    ext=["jpeg", "__key__"],
+                    missing_component_behavior="error")
+                
+                labels = fn.python_function(key, function=label_preprocess, num_outputs=1)
+
+            else:
+                jpegs, labels = fn.readers.file(
+                    file_root=data_path,
+                    # random_shuffle=False,  # (shuffles inside a initial_fill)
+                    shuffle_after_epoch=shuffle,  # (shuffles entire datasets)
+                    name="Reader",
+                    shard_id=shard_id, num_shards=num_shards
+                )
             images = fn.decoders.image(jpegs,
                                        device='mixed' if device == 'gpu' else 'cpu',
                                        output_type=types.DALIImageType.RGB)
 
             images = fn.resize(images, size=[224, 224])  # HWC
             images = fn.crop_mirror_normalize(images,
-                                              dtype=types.FLOAT,
-                                              scale=1 / 255.,
-                                              mean=[0.485, 0.456, 0.406],
-                                              std=[0.229, 0.224, 0.225],
-                                              output_layout="CHW")  # CHW
+                                            dtype=types.FLOAT,
+                                            scale=1 / 255.,
+                                            crop=(224, 224),
+                                            mirror=1,  # enable mirror augmentation
+                                            mean=[0.485, 0.456, 0.406],
+                                            std=[0.229, 0.224, 0.225],
+                                            output_layout="CHW")  # CHW
+                
             if device == "gpu":
                 labels = labels.gpu()
             # PyTorch expects labels as INT64
@@ -134,22 +170,31 @@ class LightningModel(pl.LightningModule):
         device_id = self.local_rank
         shard_id = self.global_rank
         num_shards = self.trainer.world_size
+        
+        pipeline_kwargs = {}
+        if enable_wds:
+            pipeline_kwargs['exec_async'] = False
+            pipeline_kwargs['exec_pipelined'] = False
 
         trainset_pipeline = GetImageNetPipeline(
-            data_path=os.path.join(self.dataset_path, 'train'),
+            data_path=wds_dali_train_taritems if enable_wds else os.path.join(self.dataset_path, 'train'),
             batch_size=self.batch_size, device='gpu',
             shuffle=True,
             device_id=device_id, shard_id=shard_id,
-            num_shards=num_shards, num_threads=self.num_workers
+            num_shards=num_shards, num_threads=self.num_workers,
+            is_test=False,
+            **pipeline_kwargs
         )
 
         validset_pipeline = GetImageNetPipeline(
-            data_path=os.path.join(self.dataset_path, 'val'),
+            data_path=wds_dali_val_taritems if enable_wds else os.path.join(self.dataset_path, 'val'),
             shuffle=False, device='gpu',
             device_id=device_id, shard_id=shard_id,
             # lot number of threads require lot of GPU memory
             batch_size=64, num_threads=2,
-            num_shards=num_shards
+            num_shards=num_shards,
+            is_test=True,
+            **pipeline_kwargs
         )
 
         logger.info("Creating train_loader")
@@ -176,17 +221,36 @@ class LightningModel(pl.LightningModule):
         return self.model(images)
 
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.model.parameters(
-        ), lr=self.lr, weight_decay=self.weight_decay)  # , momentum=self.momentum)
-        # scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        #     optimizer, mode='max', factor=0.5, patience=2, verbose=False, threshold=3e-3, threshold_mode='abs')
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": scheduler,
-            "monitor": "validation/accuracy"
-        }
+        optimizer = optim.SGD(self.model.parameters(), lr=self.lr, momentum=self.momentum, weight_decay=self.weight_decay)
+        return optimizer
 
+    def adjust_learning_rate(self, optimizer, epoch, total_epochs, iteration, num_iter, warmup=False, gamma=0.1, lr_decay='step', init_lr=0.1, schedule=[150, 225]):
+        lr = optimizer.param_groups[0]['lr']
+
+        warmup_epoch = 5 if warmup else 0
+        warmup_iter = warmup_epoch * num_iter
+        current_iter = iteration + epoch * num_iter
+        max_iter = total_epochs * num_iter
+
+        if lr_decay == 'step':
+            lr = init_lr * (gamma ** ((current_iter - warmup_iter) / (max_iter - warmup_iter)))
+        elif lr_decay == 'cos':
+            lr = init_lr * (1 + cos(pi * (current_iter - warmup_iter) / (max_iter - warmup_iter))) / 2
+        elif lr_decay == 'linear':
+            lr = init_lr * (1 - (current_iter - warmup_iter) / (max_iter - warmup_iter))
+        elif lr_decay == 'schedule':
+            count = sum([1 for s in schedule if s <= epoch])
+            lr = init_lr * pow(gamma, count)
+        else:
+            raise ValueError('Unknown lr mode {}'.format(lr_decay))
+
+        if epoch < warmup_epoch:
+            lr = init_lr * current_iter / warmup_iter
+
+
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        
     def on_fit_start(self):
         if self.local_rank == 0 and self.headless:
             logger.info("Begin training in headless mode")
@@ -208,18 +272,20 @@ class LightningModel(pl.LightningModule):
         return super().training_epoch_end(outputs)
 
     def training_step(self, batch, batch_idx):
+        optimizer = self.optimizers()
+        self.adjust_learning_rate(optimizer, self.current_epoch, self.num_epochs, batch_idx, len(self.train_loader))
+        
         images, labels = batch
         output = self.model(images)
-        loss = self.loss_module(output, labels)
+        # loss = self.loss_module(output, labels)
+        loss = F.cross_entropy(output, labels)
 
         with torch.no_grad():
-            output = torch.argmax(torch.log_softmax(output, -1), -1)
-            accuracy = (output == labels).float().mean()
-
-            labels = labels.cpu().numpy()
-            output = output.cpu().numpy()
-
-        self.log("train/accuracy", accuracy, on_step=True, prog_bar=True, sync_dist=True)
+            acc_top1 = (torch.argmax(torch.softmax(output, -1), -1) == labels).float().mean()
+            acc_top5 = (torch.argsort(torch.softmax(output, -1), -1)[:, :5] == torch.unsqueeze(labels, -1)).any(dim=1).float().mean()
+            
+        self.log("train/accuracy/top1", acc_top1, on_step=True, prog_bar=True, sync_dist=True)
+        self.log("train/accuracy/top5", acc_top5, on_step=True, prog_bar=True, sync_dist=True)
         self.log("train/loss", loss, on_step=True, sync_dist=True)
         return loss
     
@@ -232,16 +298,18 @@ class LightningModel(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         images, labels = batch
 
-        output = self.model(images)
-        output = torch.argmax(torch.log_softmax(output, -1), -1)
+        output_probs = torch.softmax(self.model(images), -1)
+        output = torch.argmax(output_probs, -1)
         
         self.m_acc.update(output, labels)
+        self.m_acc_t5.update(output_probs, labels)
         self.m_precision.update(output, labels)
         self.m_recall.update(output, labels)
         self.m_f1.update(output, labels)
         
-    def on_validation_epoch_start(self):        
+    def on_validation_epoch_start(self):
         self.m_acc.reset()
+        self.m_acc_t5.reset()
         self.m_precision.reset()
         self.m_recall.reset()
         self.m_f1.reset()
@@ -252,22 +320,16 @@ class LightningModel(pl.LightningModule):
             return
         
         accuracy = self.m_acc.compute()
+        accuracy_top5 = self.m_acc_t5.compute()
         precision = self.m_precision.compute()
         recall = self.m_recall.compute()
         f1 = self.m_f1.compute()
 
-        self.log("validation/accuracy", accuracy, prog_bar=True)
+        self.log("validation/accuracy/top1", accuracy, prog_bar=True)
+        self.log("validation/accuracy/top5", accuracy_top5, prog_bar=True)
         self.log("validation/precision", precision)
         self.log("validation/recall", recall)
         self.log("validation/f1", f1)
-        
-        # Do not update scheduler while initializing
-        if not self.trainer.sanity_checking:
-            # Manually update lr_scheduler
-            scheduler = self.lr_schedulers()
-            # Manual scheduler step
-            logger.info("Scheduler - accuracy step %.4f%%" % accuracy)
-            scheduler.step(accuracy)
 
 
 def parse_args():
@@ -275,13 +337,13 @@ def parse_args():
     parser.add_argument('--train-base-dir', default='./outputs')
     parser.add_argument('--disable-wandb', default=False, action='store_true')
     parser.add_argument('--wandb-login-key', default=None)
-    parser.add_argument('--wandb-project', default='mobilenetv3')
-    parser.add_argument('--expr-name', default='mbv3-b128-1gpu-scratch')
+    parser.add_argument('--wandb-project', default=None)
+    parser.add_argument('--expr-name', default='test-run-%s' % datetime.now().strftime('%Y%m%d-%H%M%S'))
     parser.add_argument('--enable-dali', '-n', default=False, action='store_true')
     parser.add_argument('--dataset-path', default='/datasets/imagenet')
     parser.add_argument('--wds-train-url', default='/datasets/imagenet/train', help='Dataset path only for webdataset')
     parser.add_argument('--wds-val-url', default='/datasets/imagenet/val', help='Dataset path only for webdataset')
-    parser.add_argument('--webdataset', default=False, action='store_true', help='Enable webdataset with given --{train|val}-dataset-path')
+    parser.add_argument('--webdataset', default=False, action='store_true', help='Enable webdataset with given --{train|val}-dataset-path - also appliable with DALI (-n)')
     parser.add_argument('--batch-size', '-b', type=int, default=128)
     parser.add_argument('--num-workers', '-w', type=int, default=16)
     parser.add_argument('--num-gpus', '-g', type=int, default=1)
@@ -334,6 +396,19 @@ def main() -> None:
 
     if args.enable_dali:
         logger.info("Creating DALI pipeline inside LightningModule")
+        if args.webdataset:
+            import glob
+            
+            assert args.wds_train_url and args.wds_val_url, "Type --wds-train-url and --wds-val-url"
+            assert 'http' not in args.wds_train_url and 'http' not in args.wds_val_url, "DALI WDS does not support http urls"
+            assert '..' not in args.wds_train_url and '..' not in args.wds_val_url, "DALI WDS does not support bash-style list. Type parent folder instead"
+            assert args.wds_train_url[-4:].lower() != '.tar' and args.wds_val_url[-4:].lower() != '.tar', "DALI WDS should provide parent folder instead of bash-style list"
+            
+            # Convert to list of URLs
+            args.wds_train_url = list(glob.glob(os.path.join(args.wds_train_url, '*.tar')))
+            args.wds_val_url = list(glob.glob(os.path.join(args.wds_val_url, '*.tar')))
+            logger.info("DALI WDS: Found {} tar files for training, {} tar files for validation".format(len(args.wds_train_url), len(args.wds_val_url)))
+        
         pass  # Initializing inside model
     elif args.webdataset:
         import webdataset as wds
@@ -465,9 +540,13 @@ def main() -> None:
         args.dataset_path,
         args.num_workers,
         args.batch_size,
+        args.train_epochs,
         learning_rate=args.learning_rate,
         enable_dali=args.enable_dali,
-        is_headless=args.headless
+        dali_wds=args.webdataset,
+        is_headless=args.headless,
+        wds_dali_train_taritems=args.wds_train_url,
+        wds_dali_val_taritems=args.wds_val_url
     )
 
     if wandb_enabled and args.num_gpus <= 1:
@@ -490,9 +569,9 @@ def main() -> None:
         RichProgressBar(refresh_rate=1),
         ModelCheckpoint(
             dirpath=checkpoint_dir,
-            filename='%s-epoch{epoch:04d}-val_acc{validation/accuracy:.2f}' % (args.expr_name),
+            filename='%s-epoch{epoch:04d}-val_acc{validation/accuracy/top1:.2f}' % (args.expr_name),
             auto_insert_metric_name=False,
-            mode="max", monitor="validation/accuracy", verbose=True
+            mode="max", monitor="validation/accuracy/top1"
         ),
         LearningRateMonitor("epoch")
     ]
@@ -500,7 +579,7 @@ def main() -> None:
     if args.early_stop:
         callbacks.append(
             EarlyStopping(
-                monitor="validation/accuracy",
+                monitor="validation/accuracy/top1",
                 patience=10,
                 min_delta=0.005,
                 mode="max",
