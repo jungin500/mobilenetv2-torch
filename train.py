@@ -141,7 +141,6 @@ class LightningModel(pl.LightningModule):
             images = fn.resize(images, size=[224, 224])  # HWC
             images = fn.crop_mirror_normalize(images,
                                             dtype=types.FLOAT,
-                                            scale=1 / 255.,
                                             crop=(224, 224),
                                             mirror=1,  # enable mirror augmentation
                                             mean=[0.485, 0.456, 0.406],
