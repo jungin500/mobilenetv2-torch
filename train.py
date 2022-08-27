@@ -2,7 +2,8 @@ from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from torch.utils.data import DataLoader
 
 import pytorch_lightning as pl
-from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers.wandb import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, RichProgressBar, EarlyStopping
 from pytorch_lightning.strategies import DDPStrategy
 
@@ -36,6 +37,7 @@ class LightningModel(pl.LightningModule):
                  num_workers,
                  batch_size,
                  num_epochs,
+                 train_loader_size,
                  learning_rate,
                  enable_dali=False,
                  dali_wds=False,
@@ -50,17 +52,17 @@ class LightningModel(pl.LightningModule):
         summary(self.model, (1, 3, 224, 224), device='cpu')
 
         # logger.info("Initializing weight (Kaiming for Conv2d, Xavier for Linear)")
-        for m in self.model.modules():
-            if isinstance(m, nn.Conv2d):
-                torch.nn.init.kaiming_uniform_(m.weight)
-            elif isinstance(m, nn.Linear):
-                torch.nn.init.xavier_uniform_(m.weight)
+        # for m in self.model.modules():
+        #     if isinstance(m, nn.Conv2d):
+        #         torch.nn.init.kaiming_uniform_(m.weight)
+        #     elif isinstance(m, nn.Linear):
+        #         torch.nn.init.xavier_uniform_(m.weight)
 
         self.lr = learning_rate
         self.weight_decay = 4e-5
-        self.momentum = 1e-4
-        self.forward_idx = 0
+        self.momentum = 0.9
         self.num_epochs = num_epochs
+        self.train_loader_size = train_loader_size
 
         # if bool(config.model.pretrained.enabled):
         #     logger.info("Loading pretrained model")
@@ -77,12 +79,18 @@ class LightningModel(pl.LightningModule):
         self.dataset_path = base_path
         self.num_workers = num_workers
         self.batch_size = batch_size
-        
+
+        if not self.use_dali:
+            print("WARNING: Disabling Learning rate curve!")
+
         self.m_acc = Accuracy()
         self.m_acc_t5 = Accuracy(top_k=5)
         self.m_f1 = F1Score()
         self.m_precision = Precision()
         self.m_recall = Recall()
+
+        self.mt_acc = Accuracy()
+        self.mt_acc_t5 = Accuracy(top_k=5)
 
     def prepare_data(self, *args, **kwargs):
         if self.use_dali:
@@ -102,7 +110,7 @@ class LightningModel(pl.LightningModule):
         from nvidia.dali.plugin.pytorch import DALIClassificationIterator, LastBatchPolicy
         import torch
         import os
-        
+
         enable_wds = self.use_dali_wds
         wds_dali_train_taritems = self.wds_dali_train_taritems
         wds_dali_val_taritems = self.wds_dali_val_taritems
@@ -112,18 +120,18 @@ class LightningModel(pl.LightningModule):
             if enable_wds:
                 logger.warning("Enabling experimental WDS support for DALI pipeline")
                 from pathlib import Path
-                
+
                 synset_to_class_map = { k[0]: int(k[1]) for k in [line.split(' ') for line in open('imagenet_synset_to_class.txt', 'r').read().strip().splitlines()] }
                 def label_preprocess(key):
                     synset_name = str(Path(key).parent)
                     class_id = synset_to_class_map[synset_name]
                     return class_id
-                
+
                 jpegs, key = fn.readers.webdataset(
                     paths=data_path,
                     ext=["jpeg", "__key__"],
                     missing_component_behavior="error")
-                
+
                 labels = fn.python_function(key, function=label_preprocess, num_outputs=1)
 
             else:
@@ -146,7 +154,7 @@ class LightningModel(pl.LightningModule):
                                             mean=[0.485, 0.456, 0.406],
                                             std=[0.229, 0.224, 0.225],
                                             output_layout="CHW")  # CHW
-                
+
             if device == "gpu":
                 labels = labels.gpu()
             # PyTorch expects labels as INT64
@@ -169,7 +177,7 @@ class LightningModel(pl.LightningModule):
         device_id = self.local_rank
         shard_id = self.global_rank
         num_shards = self.trainer.world_size
-        
+
         pipeline_kwargs = {}
         if enable_wds:
             pipeline_kwargs['exec_async'] = False
@@ -213,105 +221,67 @@ class LightningModel(pl.LightningModule):
             return super().val_dataloader(*args, **kwargs)
         return self.valid_loader
 
-    def forward(self, images):
-        print("Batch %05d -> Batches: %d" %
-              (self.forward_idx, images.shape[0]))
-        self.forward_idx += 1
-        return self.model(images)
-
     def configure_optimizers(self):
         optimizer = optim.SGD(self.model.parameters(), lr=self.lr, momentum=self.momentum, weight_decay=self.weight_decay)
         return optimizer
 
-    def adjust_learning_rate(self, iteration, warmup=False, gamma=0.1, lr_decay='cos', init_lr=0.05, schedule=[150, 225]):
-        optimizer = self.optimizers()
-        epoch = self.current_epoch
-        total_epochs = self.num_epochs
-        num_iter = len(self.train_loader)  # Will not work on non-DALI environment!
-        
+    def adjust_learning_rate(self, optimizer, epoch, total_epochs, iteration, num_iter, base_lr = 0.05, lr_decay_type = 'cos'):
         lr = optimizer.param_groups[0]['lr']
 
-        warmup_epoch = 5 if warmup else 0
-        warmup_iter = warmup_epoch * num_iter
         current_iter = iteration + epoch * num_iter
         max_iter = total_epochs * num_iter
 
-        if lr_decay == 'step':
-            lr = init_lr * (gamma ** ((current_iter - warmup_iter) / (max_iter - warmup_iter)))
-        elif lr_decay == 'cos':
-            lr = init_lr * (1 + cos(pi * (current_iter - warmup_iter) / (max_iter - warmup_iter))) / 2
-        elif lr_decay == 'linear':
-            lr = init_lr * (1 - (current_iter - warmup_iter) / (max_iter - warmup_iter))
-        elif lr_decay == 'schedule':
-            count = sum([1 for s in schedule if s <= epoch])
-            lr = init_lr * pow(gamma, count)
+        if lr_decay_type == 'cos':
+            lr = base_lr * (1 + cos(pi * current_iter / max_iter)) / 2
+        elif lr_decay_type == 'linear':
+            lr = base_lr * (1 - current_iter / max_iter)
         else:
-            raise ValueError('Unknown lr mode {}'.format(lr_decay))
-
-        if epoch < warmup_epoch:
-            lr = init_lr * current_iter / warmup_iter
-
+            raise ValueError('Unknown lr mode {}'.format(lr_decay_type))
 
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
-        
+
     def on_fit_start(self):
         if self.local_rank == 0 and self.headless:
             logger.info("Begin training in headless mode")
+        self.adjust_learning_rate(
+            optimizer=self.optimizers(),
+            epoch=0, total_epochs=self.num_epochs,
+            iteration=0, num_iter=self.train_loader_size
+        )
 
-        self.adjust_learning_rate(0)
-        
     def on_train_epoch_start(self) -> None:
-        if not self.trainer.sanity_checking and self.headless:
-            logger.info(
-                f"[State={self.trainer.state.status}] Epoch {self.trainer.current_epoch} begin")
-        return super().on_train_epoch_start()
-
-    def on_train_epoch_end(self) -> None:
-        if not self.trainer.sanity_checking and self.headless:
-            logger.info(
-                f"[State={self.trainer.state.status}] Epoch {self.trainer.current_epoch} end")
-        return super().on_train_epoch_end()
-
-    def training_epoch_end(self, outputs):
-        self.forward_idx += 1
-        return super().training_epoch_end(outputs)
+        self.mt_acc.reset()
+        self.mt_acc_t5.reset()
 
     def training_step(self, batch, batch_idx):
-        self.adjust_learning_rate(batch_idx)
-        
+        self.adjust_learning_rate(
+            optimizer=self.optimizers(),
+            epoch=self.current_epoch, total_epochs=self.num_epochs,
+            iteration=batch_idx, num_iter=self.train_loader_size
+        )
+
         images, labels = batch
         output = self.model(images)
         # loss = self.loss_module(output, labels)
         loss = F.cross_entropy(output, labels)
 
         with torch.no_grad():
-            acc_top1 = (torch.argmax(torch.softmax(output, -1), -1) == labels).float().mean()
-            acc_top5 = (torch.argsort(torch.softmax(output, -1), -1)[:, :5] == torch.unsqueeze(labels, -1)).any(dim=1).float().mean()
-            
-        self.log("train/accuracy/top1", acc_top1, on_step=True, prog_bar=True, sync_dist=True)
-        self.log("train/accuracy/top5", acc_top5, on_step=True, prog_bar=True, sync_dist=True)
+            output_probs = torch.softmax(output, -1)
+            output = torch.argmax(output_probs, -1)
+
+            self.mt_acc.update(output, labels)
+            self.mt_acc_t5.update(output_probs, labels)
+            accuracy_t1 = self.mt_acc.compute()
+            accuracy_t5 = self.mt_acc_t5.compute()
+
+            self.log('train/accuracy/top1', accuracy_t1, on_step=True, prog_bar=True)
+            self.log('train/accuracy/top5', accuracy_t5, on_step=True, prog_bar=True)
+
+        self.log('lr', self.optimizers().param_groups[0]['lr'], on_step=True, prog_bar=True)
         self.log("train/loss", loss, on_step=True, sync_dist=True)
         return loss
-    
-    def on_train_batch_end(self, outputs, batch, batch_idx: int, unused: int = 0) -> None:
-        if self.local_rank == 0 and self.headless:
-            if batch_idx % 10 == 0:
-                print("\r\n", end='', flush=True)  # for Kubernetes to display progresbar correctly
-        return super().on_train_batch_end(outputs, batch, batch_idx, unused)
 
-    def validation_step(self, batch, batch_idx):
-        images, labels = batch
-
-        output_probs = torch.softmax(self.model(images), -1)
-        output = torch.argmax(output_probs, -1)
-        
-        self.m_acc.update(output, labels)
-        self.m_acc_t5.update(output_probs, labels)
-        self.m_precision.update(output, labels)
-        self.m_recall.update(output, labels)
-        self.m_f1.update(output, labels)
-        
     def on_validation_epoch_start(self):
         self.m_acc.reset()
         self.m_acc_t5.reset()
@@ -319,11 +289,23 @@ class LightningModel(pl.LightningModule):
         self.m_recall.reset()
         self.m_f1.reset()
 
+    def validation_step(self, batch, batch_idx):
+        images, labels = batch
+
+        output_probs = torch.softmax(self.model(images), -1)
+        output = torch.argmax(output_probs, -1)
+
+        self.m_acc.update(output, labels)
+        self.m_acc_t5.update(output_probs, labels)
+        self.m_precision.update(output, labels)
+        self.m_recall.update(output, labels)
+        self.m_f1.update(output, labels)
+
     def on_validation_epoch_end(self):
         if '_update_count' in dir(self.m_acc) and self.m_acc._update_count == 0:
             logger.info("Skipped logging validation metrics")
             return
-        
+
         accuracy = self.m_acc.compute()
         accuracy_top5 = self.m_acc_t5.compute()
         precision = self.m_precision.compute()
@@ -375,7 +357,7 @@ def main() -> None:
     # directory internally used by pytorch lightning
     trainer_root_dir = os.path.join(base_dir, 'trainer')
     os.makedirs(trainer_root_dir, exist_ok=True)
-
+    
     wandb_enabled = not args.disable_wandb and not args.debug
 
     if not os.path.exists(checkpoint_dir):
@@ -403,17 +385,17 @@ def main() -> None:
         logger.info("Creating DALI pipeline inside LightningModule")
         if args.webdataset:
             import glob
-            
+
             assert args.wds_train_url and args.wds_val_url, "Type --wds-train-url and --wds-val-url"
             assert 'http' not in args.wds_train_url and 'http' not in args.wds_val_url, "DALI WDS does not support http urls"
             assert '..' not in args.wds_train_url and '..' not in args.wds_val_url, "DALI WDS does not support bash-style list. Type parent folder instead"
             assert args.wds_train_url[-4:].lower() != '.tar' and args.wds_val_url[-4:].lower() != '.tar', "DALI WDS should provide parent folder instead of bash-style list"
-            
+
             # Convert to list of URLs
             args.wds_train_url = list(glob.glob(os.path.join(args.wds_train_url, '*.tar')))
             args.wds_val_url = list(glob.glob(os.path.join(args.wds_val_url, '*.tar')))
             logger.info("DALI WDS: Found {} tar files for training, {} tar files for validation".format(len(args.wds_train_url), len(args.wds_val_url)))
-        
+
         pass  # Initializing inside model
     elif args.webdataset:
         import webdataset as wds
@@ -421,71 +403,23 @@ def main() -> None:
         from PIL import Image
         import io
         import cv2
-        
+
         logger.info("Creating Webdataset dataloader")
-        
+
         def cv2decode(value):
             image = cv2.imdecode(np.frombuffer(value, dtype=np.uint8), cv2.IMREAD_COLOR)
             image = cv2.resize(image, (224, 224))
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             image = Image.fromarray(image)
             return image
-        
+
         train_ds_url, val_ds_url = args.wds_train_url, args.wds_val_url
         train_dataset = wds.WebDataset(train_ds_url).shuffle(1000).decode(wds.handle_extension('jpg jpeg', cv2decode)).to_tuple("jpeg", "__key__")
         val_dataset = wds.WebDataset(val_ds_url).shuffle(1000).decode(wds.handle_extension('jpg jpeg', cv2decode)).to_tuple("jpeg", "__key__")
-    
+
         synset_to_class_map = { k[0]: int(k[1]) for k in [line.split(' ') for line in open('imagenet_synset_to_class.txt', 'r').read().strip().splitlines()] }
-        
+
         train_transform = T.Compose([
-            # T.RandomHorizontalFlip(p=0.5),
-            # T.RandomVerticalFlip(p=0.5),
-            # T.RandomAutocontrast(p=0.5),
-            T.ToTensor(),
-            T.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
-        
-        val_transform = T.Compose([
-            T.ToTensor(),
-            T.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
-        
-        def create_preprocessor(transform=lambda image: image):
-            def preprocess(sample):
-                image, key = sample
-                synset_name = str(Path(key).parent)
-                class_id = synset_to_class_map[synset_name]
-                
-                image = transform(image)
-                return image, class_id
-            
-            return preprocess
-        
-        train_dataset = train_dataset.map(create_preprocessor(train_transform))
-        val_dataset = val_dataset.map(create_preprocessor(val_transform))
-        
-        train_loader = wds.WebLoader(
-            train_dataset,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-        )
-        
-        val_loader = wds.WebLoader(
-            val_dataset,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-        )
-        
-    else:
-        logger.info("Creating standard ImageNet dataloader")
-        train_transform = T.Compose([
-            T.Resize([224, 224]),
             # T.RandomHorizontalFlip(p=0.5),
             # T.RandomVerticalFlip(p=0.5),
             # T.RandomAutocontrast(p=0.5),
@@ -497,7 +431,73 @@ def main() -> None:
         ])
 
         val_transform = T.Compose([
-            T.Resize([224, 224]),
+            T.ToTensor(),
+            T.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+
+        def create_preprocessor(transform=lambda image: image):
+            def preprocess(sample):
+                image, key = sample
+                synset_name = str(Path(key).parent)
+                class_id = synset_to_class_map[synset_name]
+
+                image = transform(image)
+                return image, class_id
+
+            return preprocess
+
+        train_dataset = train_dataset.map(create_preprocessor(train_transform))
+        val_dataset = val_dataset.map(create_preprocessor(val_transform))
+
+        train_loader = wds.WebLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
+
+        val_loader = wds.WebLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
+
+    else:
+        logger.info("Creating standard ImageNet dataloader")
+        # train_transform = T.Compose([
+        #     T.Resize([224, 224]),
+        #     # T.RandomHorizontalFlip(p=0.5),
+        #     # T.RandomVerticalFlip(p=0.5),
+        #     # T.RandomAutocontrast(p=0.5),
+        #     T.ToTensor(),
+        #     T.Normalize(
+        #         mean=[0.485, 0.456, 0.406],
+        #         std=[0.229, 0.224, 0.225]
+        #     )
+        # ])
+        train_transform = T.Compose([
+            T.RandomResizedCrop(224),
+            T.RandomHorizontalFlip(),
+            T.ToTensor(),
+            T.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+
+        # val_transform = T.Compose([
+        #     T.Resize([224, 224]),
+        #     T.ToTensor(),
+        #     T.Normalize(
+        #         mean=[0.485, 0.456, 0.406],
+        #         std=[0.229, 0.224, 0.225]
+        #     )
+        # ])
+        val_transform = T.Compose([
+            T.Resize(int(224 / 0.875)),
+            T.CenterCrop(224),
             T.ToTensor(),
             T.Normalize(
                 mean=[0.485, 0.456, 0.406],
@@ -546,6 +546,7 @@ def main() -> None:
         args.num_workers,
         args.batch_size,
         args.train_epochs,
+        train_loader_size=len(train_loader),
         learning_rate=args.learning_rate,
         enable_dali=args.enable_dali,
         dali_wds=args.webdataset,
@@ -569,7 +570,7 @@ def main() -> None:
     if args.webdataset:
         args.train_limit_batches = int(1282000 / args.batch_size)
         args.val_limit_batches = int(50000 / args.batch_size)
-        
+
     callbacks = [
         RichProgressBar(refresh_rate=1),
         ModelCheckpoint(
@@ -580,7 +581,7 @@ def main() -> None:
         ),
         LearningRateMonitor(logging_interval='step')
     ]
-    
+
     if args.early_stop:
         callbacks.append(
             EarlyStopping(
@@ -591,13 +592,13 @@ def main() -> None:
                 verbose=True
             )
         )
-        
+
     trainer = pl.Trainer(
         logger=lightning_logger,
         log_every_n_steps=5,
         default_root_dir=trainer_root_dir,
         accelerator='gpu' if args.num_gpus > 0 else 'cpu',
-        gpus=args.num_gpus,
+        devices=args.num_gpus,
         strategy=strategy,
         precision=args.train_precision if args.num_gpus > 0 else 'bf16',
         max_epochs=args.train_epochs,
